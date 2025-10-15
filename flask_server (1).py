@@ -12,7 +12,7 @@ app = Flask(__name__)
 CORS(app)
 
 
-# Initialize S3 client
+# Initialize S3 client with explicit credentials
 s3 = boto3.client("s3")
 BUCKET_NAME = "aws23bps"
 
@@ -20,6 +20,8 @@ def generate_unique_filename(user_id, original_filename):
     """Generate a unique filename with user_id and timestamp"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     file_extension = os.path.splitext(original_filename)[1]
+    #unique_id = str(uuid.uuid4())[:8]
+    #return f"{user_id}_{timestamp}_{unique_id}{file_extension}"
     return f"{user_id}_{timestamp}{file_extension}"
 
 def determine_media_type(filename):
@@ -32,10 +34,9 @@ def determine_media_type(filename):
             return 'video'
     return 'unknown'
 
-# FIX 1: The function signature was corrected. It now expects 3 arguments, not 4.
-def upload_metadata_to_s3(filename, metadata, username):
+def upload_metadata_to_s3(filename, metadata):
     """Upload metadata as JSON to S3"""
-    metadata_key = f"metadata/{username}/{filename}.json"
+    metadata_key = f"metadata/{filename}.json"
     try:
         s3.put_object(
             Bucket=BUCKET_NAME,
@@ -68,6 +69,7 @@ def upload_file():
         return '', 200
     
     try:
+        # Get form data
         if 'files' not in request.files:
             return jsonify({'error': 'No file provided'}), 400
         
@@ -78,14 +80,17 @@ def upload_file():
         caption = request.form.get('caption', '')
         username = request.form.get('username', 'anonymous')
         
+        # Debug: Log the username being received
         print(f"DEBUG: Received username from frontend: '{username}'")
         
+        # Generate unique filename
         unique_filename = generate_unique_filename(username, file.filename)
-        # The key now correctly includes the username folder
-        media_key = f"media/{username}/{unique_filename}"
+        media_key = f"media/{unique_filename}"
         
+        # Determine media type
         media_type = determine_media_type(file.filename)
         
+        # Create metadata
         metadata = {
             'filename': unique_filename,
             'original_filename': file.filename,
@@ -97,8 +102,10 @@ def upload_file():
             's3_key': media_key
         }
         
+        # Reset file pointer
         file.seek(0)
         
+        # Upload file to S3
         try:
             s3.upload_fileobj(
                 file,
@@ -109,16 +116,15 @@ def upload_file():
         except Exception as e:
             return jsonify({'error': f'Failed to upload file to S3: {str(e)}'}), 500
         
-        # FIX 1 (continued): The function call now matches the corrected definition.
-        if not upload_metadata_to_s3(unique_filename, metadata, username):
+        # Upload metadata to S3
+        if not upload_metadata_to_s3(unique_filename, metadata):
             return jsonify({'error': 'File uploaded but failed to save metadata'}), 500
         
         return jsonify({
             'message': 'File uploaded successfully',
             'filename': unique_filename,
             'media_type': media_type,
-            'metadata': metadata,
-            'username' : username
+            'metadata': metadata
         }), 200
         
     except Exception as e:
@@ -130,8 +136,7 @@ def get_media():
     try:
         current_user = request.args.get('current_user', '')
         
-        # FIX 2: We still list the whole 'metadata/' folder here, which is necessary
-        # to get posts from ALL other users. Your original logic was correct for this goal.
+        # List all metadata files from S3
         response = s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix='metadata/')
         
         if 'Contents' not in response:
@@ -142,17 +147,20 @@ def get_media():
         for obj in response['Contents']:
             metadata_key = obj['Key']
             
+            # Skip if not a JSON file
             if not metadata_key.endswith('.json'):
                 continue
             
             try:
+                # Get metadata from S3
                 metadata_response = s3.get_object(Bucket=BUCKET_NAME, Key=metadata_key)
                 metadata = json.loads(metadata_response['Body'].read())
                 
                 # Skip if it's the current user's media
-                #if metadata.get('username') == current_user:
-                    #continue
+                if metadata.get('username') == current_user:
+                    continue
                 
+                # Generate presigned URL for the media file
                 media_url = get_presigned_url(metadata['s3_key'])
                 if media_url:
                     media_item = {
@@ -166,9 +174,11 @@ def get_media():
                         'file_size': metadata.get('file_size', 0)
                     }
                     
+                    # Add type-specific fields
                     if media_item['type'] == 'video':
                         media_item['videoUrl'] = media_url
-                        media_item['thumbnail'] = media_url
+                        # You can add thumbnail generation logic here
+                        media_item['thumbnail'] = media_url  # For now, use same URL
                     elif media_item['type'] == 'image':
                         media_item['imageUrl'] = media_url
                     
@@ -178,6 +188,7 @@ def get_media():
                 print(f"Error processing metadata {metadata_key}: {e}")
                 continue
         
+        # Sort by timestamp (newest first)
         media_list.sort(key=lambda x: x['timestamp'], reverse=True)
         
         return jsonify({'media': media_list}), 200
@@ -193,10 +204,8 @@ def get_user_media():
         if not username:
             return jsonify({'error': 'Username required'}), 400
         
-        # FIX 2 (continued): This is much more efficient.
-        # We now specify the user's folder in the prefix to only list their files.
-        prefix = f"metadata/{username}/"
-        response = s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix=prefix)
+        # List all metadata files from S3
+        response = s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix='metadata/')
         
         if 'Contents' not in response:
             return jsonify({'media': []}), 200
@@ -210,28 +219,31 @@ def get_user_media():
                 continue
             
             try:
+                # Get metadata from S3
                 metadata_response = s3.get_object(Bucket=BUCKET_NAME, Key=metadata_key)
                 metadata = json.loads(metadata_response['Body'].read())
                 
-                # No longer need to check username here since the prefix already filtered for us
-                media_url = get_presigned_url(metadata['s3_key'])
-                if media_url:
-                    media_item = {
-                        'id': metadata.get('filename', '').replace('.', '_'),
-                        'type': metadata.get('media_type', 'unknown'),
-                        'username': metadata.get('username', 'unknown'),
-                        'caption': metadata.get('caption', ''),
-                        'timestamp': metadata.get('upload_timestamp', ''),
-                        'url': media_url,
-                        'original_filename': metadata.get('original_filename', ''),
-                        'file_size': metadata.get('file_size', 0)
-                    }
-                    user_media.append(media_item)
+                # Only include this user's media
+                if metadata.get('username') == username:
+                    media_url = get_presigned_url(metadata['s3_key'])
+                    if media_url:
+                        media_item = {
+                            'id': metadata.get('filename', '').replace('.', '_'),
+                            'type': metadata.get('media_type', 'unknown'),
+                            'username': metadata.get('username', 'unknown'),
+                            'caption': metadata.get('caption', ''),
+                            'timestamp': metadata.get('upload_timestamp', ''),
+                            'url': media_url,
+                            'original_filename': metadata.get('original_filename', ''),
+                            'file_size': metadata.get('file_size', 0)
+                        }
+                        user_media.append(media_item)
                         
             except Exception as e:
                 print(f"Error processing metadata {metadata_key}: {e}")
                 continue
         
+        # Sort by timestamp (newest first)
         user_media.sort(key=lambda x: x['timestamp'], reverse=True)
         
         return jsonify({'media': user_media}), 200
@@ -241,7 +253,12 @@ def get_user_media():
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({ 'status': 'healthy', 'timestamp': datetime.now().isoformat() }), 200
+    """Simple health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'bucket': BUCKET_NAME
+    }), 200
 
 @app.route('/delete-media', methods=['DELETE'])
 def delete_media():
@@ -254,9 +271,8 @@ def delete_media():
         if not filename or not username:
             return jsonify({'error': 'Filename and username required'}), 400
         
-        # FIX 3: Updated metadata_key to include the username folder.
-        metadata_key = f"metadata/{username}/{filename}.json"
-        
+        # Verify ownership by checking metadata
+        metadata_key = f"metadata/{filename}.json"
         try:
             metadata_response = s3.get_object(Bucket=BUCKET_NAME, Key=metadata_key)
             metadata = json.loads(metadata_response['Body'].read())
@@ -267,8 +283,8 @@ def delete_media():
         except ClientError:
             return jsonify({'error': 'Media not found'}), 404
         
-        # FIX 3 (continued): Updated media_key to include the username folder.
-        media_key = f"media/{username}/{filename}"
+        # Delete media file and metadata
+        media_key = f"media/{filename}"
         
         try:
             s3.delete_object(Bucket=BUCKET_NAME, Key=media_key)
@@ -285,4 +301,11 @@ def delete_media():
 if __name__ == '__main__':
     print(f"Flask server starting...")
     print(f"S3 Bucket: {BUCKET_NAME}")
+    print("Available endpoints:")
+    print("  POST /upload - Upload media with caption")
+    print("  GET /media?current_user=username - Get media from other users") 
+    print("  GET /user-media?username=username - Get media for specific user")
+    print("  DELETE /delete-media - Delete user's media")
+    print("  GET /health - Health check")
+    
     app.run(host='0.0.0.0', port=8000, debug=True)
